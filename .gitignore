@@ -1,0 +1,13 @@
+# 运行时（Electron + Python + Node，体量大，走 Release 分发，不进仓库）
+runtime/
+
+# 依赖
+node_modules/
+
+# 个人数据与日志（含 cookie/roomId 之外的设置、日志、临时文件）
+save/
+*.log
+log*.txt
+
+# 编译产物（源码在 launcher/，完整 exe 走 Release 分发）
+Bili Danmu Bot.exe

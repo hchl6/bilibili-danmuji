@@ -1,0 +1,13 @@
+{
+  "name": "bilibili-danmuji",
+  "version": "1.0.0",
+  "description": "B站直播弹幕姬 - 弹幕实时显示 + 语音播报",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>弹幕小窗</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; background:transparent; overflow:hidden; }
+  body { font-family:"Microsoft YaHei","PingFang SC",sans-serif; }
+  /* 飘屏模式容器 */
+  #stage { position:fixed; inset:0; pointer-events:none; }
+  .dm {
+    position:absolute;
+    left:100%;
+    white-space:nowrap;
+    font-weight:700;
+    text-shadow: 0 0 4px rgba(0,0,0,.95), 0 2px 3px rgba(0,0,0,.85);
+    will-change: transform;
+    animation: fly linear forwards;
+  }
+  @keyframes fly {
+    from { transform: translateX(0); }
+    to   { transform: translateX(calc(-100vw - 100%)); }
+  }
+  /* 列表模式容器：从底部往上堆叠，新弹幕在下方，旧的被往上顶 */
+  #list {
+    position:absolute; left:10px; right:10px; bottom:10px;
+    display:flex; flex-direction:column; justify-content:flex-end;
+    pointer-events:none;
+  }
+  .list-item {
+    display:flex; align-items:baseline; gap:6px;
+    font-weight:700;
+    text-shadow: 0 0 4px rgba(0,0,0,.95), 0 2px 3px rgba(0,0,0,.85);
+    margin-bottom:6px;
+  }
+  .list-item .time {
+    flex:0 0 auto;
+    color:rgba(255,255,255,.55);
+    font-weight:400;
+    font-size:.72em;
+  }
+  /* 弹幕内容自动换行：窗口缩小时不盖住文字（时间戳固定列，内容自适应折行） */
+  .list-item .body {
+    min-width:0;
+    white-space:normal;
+    word-break:break-all;
+    overflow-wrap:break-word;
+  }
+  /* 未锁定时的定位边框：Electron 壳通过 body[data-overlay-locked] 控制；OBS 浏览器源无此属性，不显示 */
+  body[data-overlay-locked="false"] { outline: 2px solid rgba(255,255,255,.9); outline-offset: -2px; }
+  /* 拖动/缩放层：覆盖整个窗口。边缘 8px 内判定为 resize、中间为拖动（见下方 script）。
+     因 transparent+resizable 会把整窗误判为 resize 区，系统 resize 已禁用，move/resize 全手动 */
+  #__dragzone {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+  }
+  /* 锁/解锁按钮：顶部居中。锁按钮仅 Electron 未锁定时显示，解锁按钮仅锁定时悬停显示（OBS 无相关属性 → 均隐藏）。
+     作为拖动层子元素，点它不会触发拖拽（script 里按 e.target 判断） */
+  #lockBtn, #unlockBtn {
+    display: none;
+    position: fixed;
+    top: 6px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 32px; height: 32px;
+    border-radius: 6px;
+    background: rgba(0,0,0,.35);
+    border: 1px solid rgba(255,255,255,.65);
+    color: #fff;
+    font-size: 16px;
+    line-height: 1;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    cursor: pointer;
+    z-index: 10000;
+  }
+  #lockBtn:hover, #unlockBtn:hover { background: rgba(0,0,0,.55); }
+  body[data-overlay-locked="false"] #lockBtn { display: flex; }
+  body[data-unlock-hover="true"] #unlockBtn { display: flex; }
+  /* 调试面板：仅 ?debug=1 时显示 */
+  #dbg {
+    display:none;
+    position:fixed; left:8px; top:8px; z-index:9;
+    background:rgba(0,0,0,.75); color:#0f0; font-size:12px;
+    padding:6px 10px; border-radius:6px; font-family:Consolas,monospace;
+    white-space:pre-wrap; pointer-events:none;
+  }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="list"></div>
+<div id="dbg"></div>
+<div id="__dragzone">
+  <button id="lockBtn" title="锁定（锁定后鼠标穿透，Ctrl+Shift+L 解锁）">🔒</button>
+  <button id="unlockBtn" title="解锁">🔓</button>
+</div>
+<script>
+(function(){
+  if (window.console && console.info) console.info('danmaku-window v3.4 · dm-2609-7A3F');
+  var stage = document.getElementById('stage');
+  var listEl = document.getElementById('list');
+  var dbg = document.getElementById('dbg');
+  var qs = new URLSearchParams(location.search);
+  var fontSize = parseInt(qs.get('fontSize')) || 32;   // 字号
+  var speed = parseFloat(qs.get('speed')) || 10;       // 飘屏秒数（仅 fly 模式用）
+  var maxItems = parseInt(qs.get('max')) || 20;        // 列表模式最多显示条数
+  var mode = qs.get('mode') === 'fly' ? 'fly' : 'list'; // 默认列表模式；?mode=fly 切飘屏
+  var debug = qs.get('debug') === '1';
+  var selftest = qs.get('test') === '1';
+  var laneIdx = 0;
+  var tailWord = '';   // 尾词（从 cfg 同步，弹幕文本末尾追加，如"喵"）
+  var danmakuColor = qs.get('color') || '#ffffff';     // 弹幕固定颜色（cfg 同步；随机颜色开时忽略）
+  var randomColor = qs.get('random') === '1';          // 随机颜色弹幕（cfg 同步）
+  var danmakuFont = qs.get('font') || 'Microsoft YaHei'; // 弹幕字体（cfg 同步）
+  var evCount = 0, lastMsg = '-', connState = '连接中…';
+
+  function laneCount(){
+    return Math.max(1, Math.floor(window.innerHeight / (fontSize + 14)));
+  }
+  function dbgLog(){
+    if(!debug) return;
+    dbg.style.display = 'block';
+    dbg.textContent = '模式: ' + mode + '\n连接: ' + connState + '\n收到event: ' + evCount + '\n最近消息: ' + lastMsg;
+  }
+  var RANDOM_COLORS = [
+    '#ffffff', // 白
+    '#ff6b6b', // 红
+    '#ffd93d', // 黄
+    '#c792ea', // 紫
+    '#7ee787', // 绿
+    '#ff9f43', // 橙
+    '#79c0ff', // 蓝
+    '#ffd700', // 金
+    '#4dd0e1', // 青
+    '#8b5a2b', // 棕
+    '#ff8bc7', // 粉
+  ];
+  var randColorIdx = 0;   // 顺序循环游标：按固定顺序取色，相邻弹幕颜色必然不同
+  function randomColorOf(){
+    var c = RANDOM_COLORS[randColorIdx];
+    randColorIdx = (randColorIdx + 1) % RANDOM_COLORS.length;
+    return c;
+  }
+  function colorOf(type){
+    if(type === 'danmaku'){
+      if(randomColor) return randomColorOf();   // 循环颜色弹幕（按固定顺序循环取色）
+      return danmakuColor;                      // 固定颜色（控制面板可调）
+    }
+    if(type === 'enter' || type === 'effect_enter') return '#7ee787';
+    if(type === 'gift') return '#ffb84d';
+    if(type === 'superchat') return '#ff6b6b';
+    if(type === 'guard' || type === 'welcome') return '#ffd23f';
+    return '#ffffff';
+  }
+  function textOf(ev){
+    if(ev.type === 'danmaku') return ev.uname + '：' + ev.text + tailWord;
+    if(ev.type === 'enter') return ev.msgType === 2 ? ev.uname + ' 关注了直播间' : ev.uname + ' 进入直播间';
+    if(ev.type === 'effect_enter') return (ev.uname || ev.text || '') + ' 来了';
+    if(ev.type === 'gift') return ev.uname + ' 送出 ' + ev.num + ' 个' + ev.giftName;
+    if(ev.type === 'superchat') return ev.uname + ' 醒目留言：' + ev.text;
+    if(ev.type === 'guard' || ev.type === 'welcome') return ev.uname + ' 上舰啦';
+    return '';
+  }
+  function spawnFly(ev){
+    var text = textOf(ev);
+    if(!text) return;
+    var el = document.createElement('div');
+    el.className = 'dm';
+    el.style.color = colorOf(ev.type);
+    el.style.fontSize = fontSize + 'px';
+    el.style.fontFamily = danmakuFont;
+    el.style.top = (5 + (laneIdx % laneCount()) * (fontSize + 14)) + 'px';
+    laneIdx++;
+    el.textContent = text;
+    el.style.animationDuration = speed + 's';
+    stage.appendChild(el);
+    el.addEventListener('animationend', function(){ el.remove(); });
+    setTimeout(function(){ if(el.parentNode) el.remove(); }, speed * 1000 + 600);
+  }
+  function timeStr(){
+    var d = new Date();
+    function p(n){ return (n < 10 ? '0' : '') + n; }
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+  function spawnList(ev){
+    var text = textOf(ev);
+    if(!text) return;
+    var el = document.createElement('div');
+    el.className = 'list-item';
+    el.style.fontSize = fontSize + 'px';
+    el.style.fontFamily = danmakuFont;
+    var t = document.createElement('span');
+    t.className = 'time';
+    t.textContent = timeStr();
+    var b = document.createElement('span');
+    b.className = 'body';
+    b.style.color = colorOf(ev.type);
+    b.textContent = text;
+    el.appendChild(t);
+    el.appendChild(b);
+    listEl.appendChild(el);
+    while(listEl.children.length > maxItems) listEl.removeChild(listEl.firstChild);
+  }
+  function spawn(ev){
+    if(mode === 'fly') spawnFly(ev); else spawnList(ev);
+  }
+  function clearDisplay(){
+    stage.innerHTML = '';
+    listEl.innerHTML = '';
+    laneIdx = 0;
+  }
+
+  function connect(){
+    var ws;
+    try { ws = new WebSocket('ws://' + location.host); }
+    catch(e){ connState = 'WebSocket创建失败'; dbgLog(); return; }
+    ws.onopen = function(){ connState = '已连接'; dbgLog(); };
+    ws.onmessage = function(e){
+      var m;
+      try { m = JSON.parse(e.data); } catch(err){ return; }
+      lastMsg = m.type;
+      if(m.type === 'event' && m.ev){ evCount++; spawn(m.ev); }
+      if(m.type === 'fonts-updated'){ loadFonts(); } // 上传新字体后，重新拉取并注入 @font-face（无需重开窗口）
+      if(m.type === 'cfg' && m.cfg){
+        // 尾词同步（弹幕文本末尾追加）
+        if(typeof m.cfg.tailWord === 'string') tailWord = m.cfg.tailWord;
+        // 显示模式同步（控制面板切换 → 透明窗/OBS 跟随）
+        if(m.cfg.danmakuMode === 'fly' || m.cfg.danmakuMode === 'list'){
+          if(m.cfg.danmakuMode !== mode){ mode = m.cfg.danmakuMode; clearDisplay(); }
+        }
+        // 外观同步（字号/颜色/字体/随机颜色 → 透明窗/OBS 跟随）
+        if(typeof m.cfg.danmakuFontSize === 'number') fontSize = m.cfg.danmakuFontSize;
+        if(typeof m.cfg.danmakuColor === 'string') danmakuColor = m.cfg.danmakuColor;
+        if(typeof m.cfg.danmakuRandomColor === 'boolean') randomColor = m.cfg.danmakuRandomColor;
+        if(typeof m.cfg.danmakuFont === 'string' && m.cfg.danmakuFont) danmakuFont = m.cfg.danmakuFont;
+      }
+      dbgLog();
+    };
+    ws.onclose = function(){ connState = '断开，3秒重连'; dbgLog(); setTimeout(connect, 3000); };
+    ws.onerror = function(){ connState = '连接错误'; dbgLog(); try { ws.close(); } catch(err){} };
+  }
+  connect();
+
+  // 加载用户自定义字体（public/fonts/ 下的 .ttf/.otf）：动态注入 @font-face，让 fontFamily 能直接用字体名
+  // （Electron 透明窗和 OBS 浏览器源加载本页时都会各自 fetch 一次，天然同步；失败静默，不影响系统字体）
+  // 可重复调用：上传新字体后服务端广播 fonts-updated，本页重新拉取并刷新 @font-face（旧 style 先移除，防累积）
+  function loadFonts(){
+    try {
+      fetch('/api/fonts').then(function(r){ return r.ok ? r.json() : []; }).then(function(list){
+        var old = document.getElementById('__customFonts');
+        if (old && old.parentNode) old.parentNode.removeChild(old);
+        if (!list || !list.length) return;
+        var css = '';
+        list.forEach(function(f){
+          var fmt = /\.otf$/i.test(f.file) ? 'opentype' : 'truetype';
+          var fam = String(f.family || '').replace(/["\\]/g, '');
+          if (!fam) return;
+          css += '@font-face{font-family:"' + fam + '";src:url("/fonts/' + encodeURIComponent(f.file) + '") format("' + fmt + '");font-display:block;}\n';
+        });
+        if (!css) return;
+        var st = document.createElement('style');
+        st.id = '__customFonts';
+        st.textContent = css;
+        document.head.appendChild(st);
+      }).catch(function(){});
+    } catch(e){}
+  }
+  loadFonts();
+
+  // 锁/解锁按钮：点击通知 Electron 主进程切换锁定（OBS 浏览器源无 window.overlay，此分支不触发）
+  var lockBtn = document.getElementById('lockBtn');
+  if (lockBtn) {
+    lockBtn.addEventListener('click', function(){
+      if (window.overlay && window.overlay.toggleLock) window.overlay.toggleLock();
+    });
+  }
+  var unlockBtn = document.getElementById('unlockBtn');
+  if (unlockBtn) {
+    unlockBtn.addEventListener('click', function(){
+      if (window.overlay && window.overlay.toggleLock) window.overlay.toggleLock();
+    });
+  }
+
+  // 手动拖拽 + 手动缩放：pointerdown 判定鼠标位置——边缘 8px 内 = resize（带方向），中间 = move。
+  // 只发一次 interact-start（带模式）给主进程，之后由主进程轮询绝对坐标驱动窗口（多显示器 DPI 下可靠）。
+  // 不用 -webkit-app-region:drag（整片劫持鼠标 → 锁按钮点不动 + 右键弹系统菜单）；
+  // 不用系统 resize（transparent+resizable 会把整窗误判成 resize 区 → 中间拖动也变大）；
+  // 不用渲染层 e.screenX 增量（4K+Aorus 副屏 DPI 失真 → 中间拖动变大）。
+  var dz = document.getElementById('__dragzone');
+  if (dz && window.overlay && window.overlay.interactStart && window.overlay.interactEnd) {
+    var dragging = false;
+    var EDGE = 8; // 边缘 8px 内判定为 resize
+    var CURSORS = { n:'ns-resize', s:'ns-resize', e:'ew-resize', w:'ew-resize', ne:'nesw-resize', sw:'nesw-resize', nw:'nwse-resize', se:'nwse-resize' };
+    function hitDir(x, y){
+      var w = window.innerWidth, h = window.innerHeight;
+      var l = x < EDGE, r = x > w - EDGE, t = y < EDGE, b = y > h - EDGE;
+      return ((t ? 'n' : '') + (b ? 's' : '') + (l ? 'w' : '') + (r ? 'e' : '')) || 'move';
+    }
+    function stopDrag(){
+      if (!dragging) return;
+      dragging = false;
+      window.overlay.interactEnd();
+    }
+    dz.addEventListener('pointerdown', function(e){
+      if (e.button !== 0) return;      // 仅左键
+      if (e.target !== dz) return;     // 锁/解锁按钮等子元素不触发
+      dragging = true;
+      try { dz.setPointerCapture(e.pointerId); } catch(err){} // 光标移出窗口也能收到 up（避免拖拽卡死）
+      window.overlay.interactStart(hitDir(e.clientX, e.clientY));
+    });
+    dz.addEventListener('pointermove', function(e){
+      if (dragging) return;
+      dz.style.cursor = CURSORS[hitDir(e.clientX, e.clientY)] || 'move';
+    });
+    dz.addEventListener('pointerup', stopDrag);
+    dz.addEventListener('pointercancel', stopDrag);
+    window.addEventListener('blur', stopDrag);
+  }
+
+  if(selftest){
+    setTimeout(function(){
+      spawn({ type:'superchat', uname:'测试', text:'这是测试弹幕，能显示说明渲染正常' });
+      spawn({ type:'danmaku', uname:'弹幕', text:'普通弹幕测试' });
+      spawn({ type:'gift', uname:'老板', text:'', giftName:'小心心', num:1 });
+    }, 500);
+  }
+  dbgLog();
+})();
+</script>
+</body>
+</html>
